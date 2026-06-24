@@ -1,123 +1,88 @@
-import os
 import streamlit as st
-import chromadb
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext, Settings
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.llms.openai import OpenAI
-from llama_index.embeddings.openai import OpenAIEmbedding
+import os
+import pymupdf4llm
+import ollama
 
-# --- 1. PAGE CONFIGURATION ---
-st.set_page_config(page_title="RAG Document Chatbot", page_icon="📚", layout="centered")
-st.title("📚 Knowledge-Based Document Chatbot")
-st.write("Upload your PDF documentation and ask questions based on its content.")
+st.set_page_config(page_title="Mozilla Blueprint RAG", layout="centered")
+st.title("📚 Structural Markdown-Based Chatbot")
+st.write("A lightweight, vector-free implementation based on the Mozilla.ai RAG Blueprint.")
 
-# --- 2. CONFIGURING LLM & EMBEDDINGS ---
-# Safely fetch the API key from environment variables or Streamlit secrets
-openai_api_key = os.environ.get("OPENAI_API_KEY")
+# Target Directory
+UPLOAD_DIR = "uploaded_docs"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
 
-if not openai_api_key:
-    st.error("❌ OPENAI_API_KEY not found! Please set it in your environment or terminal before running.")
-    st.stop()
+# File Uploader
+uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
 
-Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0.2)
-Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+if uploaded_file is not None:
+    file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.success(f"Saved {uploaded_file.name} successfully!")
 
-# Directories for data and database
-UPLOAD_DIR = "./data"
-PERSIST_DIR = "./chroma_db"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# --- 3. CORE RAG PIPELINE FUNCTION ---
-@st.cache_resource(show_spinner=False)
-def initialize_rag_pipeline():
-    """Initializes and caches the connection to ChromaDB and the Vector Store."""
-    db = chromadb.PersistentClient(path=PERSIST_DIR)
-    chroma_collection = db.get_or_create_collection("knowledge_base")
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    
-    # Check if we already have documents indexed on disk
-    if chroma_collection.count() > 0:
-        return VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
-    return None
-
-# --- 4. SIDEBAR FOR FILE UPLOADS ---
-with st.sidebar:
-    st.header("Upload Documentation")
-    uploaded_files = st.file_uploader(
-        "Choose PDF files to add to the knowledge base", 
-        type=["pdf"], 
-        accept_multiple_files=True
-    )
-    
-    if st.button("Process & Index Documents", type="primary"):
-        if uploaded_files:
-            with st.spinner("Processing documents... This might take a moment."):
-                # Save uploaded files locally to the data directory
-                for uploaded_file in uploaded_files:
-                    file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
-                    with open(file_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                
-                # Ingest files via LlamaIndex
-                documents = SimpleDirectoryReader(UPLOAD_DIR).load_data()
-                
-                db = chromadb.PersistentClient(path=PERSIST_DIR)
-                chroma_collection = db.get_or_create_collection("knowledge_base")
-                vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-                storage_context = StorageContext.from_defaults(vector_store=vector_store)
-                
-                # Create index and clear cache to force update
-                index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
-                st.cache_resource.clear()
-                
-                st.success(f"✅ Successfully indexed {len(uploaded_files)} document(s)!")
-                st.rerun()
-        else:
-            st.warning("Please upload at least one PDF file first.")
-
-# Try to load existing index
-index = initialize_rag_pipeline()
-
-# --- 5. CHAT INTERFACE ---
-# Initialize session state for chat history if it doesn't exist
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I am your documentation assistant. Upload some files on the left, and ask me anything!"}
-    ]
-
-# Display historical messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
-
-# Handle user input
-if prompt := st.chat_input("Ask a question about your documents..."):
-    # Add user message to state and display it
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.write(prompt)
-
-    # Generate response
-    with st.chat_message("assistant"):
-        if index is None:
-            response_text = "⚠️ I don't have any data yet. Please upload and process your PDFs using the sidebar menu!"
-            st.write(response_text)
-            st.session_state.messages.append({"role": "assistant", "content": response_text})
-        else:
-            # Create chat engine on the fly
-            chat_engine = index.as_chat_engine(chat_mode="condense_plus_context", similarity_top_k=3)
+    # 1. Structural Extraction (No Vector Database / Embeddings)
+    with st.spinner("Extracting layout boundaries via PyMuPDF4LLM..."):
+        md_text = pymupdf4llm.to_markdown(file_path)
+        
+        # Parse Markdown headers into discrete semantic components
+        sections = {}
+        current_heading = "Overview"
+        current_content = []
+        
+        for line in md_text.split("\n"):
+            if line.strip().startswith(("# ", "## ", "### ")):
+                if current_content:
+                    sections[current_heading] = "\n".join(current_content).strip()
+                current_heading = line.replace("#", "").strip()
+                current_content = [line]
+            else:
+                current_content.append(line)
+        if current_content:
+            sections[current_heading] = "\n".join(current_content).strip()
             
-            # Stream the response tokens directly into the UI
-            response_placeholder = st.empty()
-            full_response = ""
+    st.info(f"Document segmented into {len(sections)} layout sections!")
+
+    # Chat UI
+    user_query = st.text_input("Ask a question about the document:")
+    
+    if user_query:
+        with st.spinner("Routing query to the correct document layout section..."):
+            # 2. Roaming RAG Router Pattern
+            titles_list = "\n".join([f"- {title}" for title in sections.keys()])
+            router_prompt = (
+                f"Select the single most relevant section title from this list that contains "
+                f"the answer to the user's question.\n\nList:\n{titles_list}\n\nQuestion: {user_query}\n\n"
+                f"Respond ONLY with the exact chosen title name."
+            )
             
-            with st.spinner("Thinking..."):
-                response_stream = chat_engine.stream_chat(prompt)
-                for token in response_stream.response_gen:
-                    full_response += token
-                    response_placeholder.markdown(full_response + "▌")
-                    
-            response_placeholder.markdown(full_response)
-            # Add assistant message to history
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            route_res = ollama.chat(
+                model="qwen2.5:0.5b",
+                messages=[{"role": "user", "content": router_prompt}],
+                options={"temperature": 0.0}
+            )
+            chosen_title = route_res['message']['content'].strip()
+            
+            # Fallback evaluation matcher
+            if chosen_title not in sections:
+                matched = [t for t in sections.keys() if t.lower() in chosen_title.lower()]
+                chosen_title = matched[0] if matched else list(sections.keys())[0]
+                
+            st.caption(f"📍 Content pulled exclusively from section: **{chosen_title}**")
+            
+        with st.spinner("Formulating localized answer..."):
+            # 3. Targeted Context Processing
+            context_block = sections[chosen_title]
+            qa_prompt = (
+                f"Answer the question strictly using this context block. If it doesn't contain the answer, "
+                f"say 'Information not found.'\n\nContext:\n{context_block}\n\nQuestion: {user_query}"
+            )
+            
+            ans_res = ollama.chat(
+                model="qwen2.5:0.5b",
+                messages=[{"role": "user", "content": qa_prompt}],
+                options={"temperature": 0.2}
+            )
+            
+            st.write("### Answer:")
+            st.write(ans_res['message']['content'].strip())
